@@ -481,6 +481,55 @@ from ansible_collections.amazon.aws.plugins.module_utils.elb_utils import get_el
 
 def create_or_update_elb(elb_obj):
     """Create ELB or modify main attributes. json_exit here"""
+
+    def separate_extra_certificates(listeners):
+        extra_certificates = {}
+        for listener in listeners:
+            if len(listener.get('Certificates',[])) > 1:
+                    extra_certificates[listener['Port']] = listener.get('Certificates')[1:]
+                    listener['Certificates'] = listener['Certificates'][:1]
+        return extra_certificates
+
+    def get_all_certificates(listeners):
+        """
+        returns a dictionary as follows:
+            {
+                "443": [
+                    {
+                        "CertificateArn": "arn:aws:acm:...",
+                        "IsDefault": true
+                    },
+                    {
+                        "CertificateArn": "arn:aws:acm:...",
+                        "IsDefault": false
+                    },
+                    {
+                        "CertificateArn": "arn:aws:acm:...",
+                        "IsDefault": false
+                    }
+                ]
+            }
+        """
+
+        certificates = {}
+        for listener in listeners:
+            next_marker = ""
+            certificates[listener['Port']] = []
+            if listener.get('ListenerArn'):
+                while True:
+                    response = elb_obj.connection.describe_listener_certificates(
+                        ListenerArn=listener.get('ListenerArn'),
+                        Marker=next_marker,
+                        PageSize=1
+                    )
+                    certificates[listener['Port']] += response.get('Certificates',[])
+                    next_marker = response.get('NextMarker', False)
+                    if not next_marker:
+                        break
+            else:
+                certificates[listener['Port']] += listener.get('Certificates',[])
+        return certificates
+
     if elb_obj.elb:
         # ELB exists so check subnets, security groups and tags match what has been passed
 
@@ -516,6 +565,10 @@ def create_or_update_elb(elb_obj):
     # Listeners
     listeners_obj = ELBListeners(elb_obj.connection, elb_obj.module, elb_obj.elb['LoadBalancerArn'])
 
+    initial_listeners = listeners_obj.current_listeners
+    initial_certificates = get_all_certificates(initial_listeners)
+    final_certificates = get_all_certificates(listeners_obj.listeners)
+
     listeners_to_add, listeners_to_modify, listeners_to_delete = listeners_obj.compare_listeners()
 
     # Delete listeners
@@ -525,6 +578,7 @@ def create_or_update_elb(elb_obj):
         listeners_obj.changed = True
 
     # Add listeners
+    separate_extra_certificates(listeners_to_add)
     for listener_to_add in listeners_to_add:
         listener_obj = ELBListener(elb_obj.connection, elb_obj.module, listener_to_add, elb_obj.elb['LoadBalancerArn'])
         listener_obj.add()
@@ -535,6 +589,25 @@ def create_or_update_elb(elb_obj):
         listener_obj = ELBListener(elb_obj.connection, elb_obj.module, listener_to_modify, elb_obj.elb['LoadBalancerArn'])
         listener_obj.modify()
         listeners_obj.changed = True
+
+
+    updated_listeners_obj = ELBListeners(elb_obj.connection, elb_obj.module, elb_obj.elb['LoadBalancerArn'])
+    for listener in updated_listeners_obj.current_listeners:
+        port = listener['Port']
+        old_certs = [x['CertificateArn'] for x in initial_certificates.get(port,[])[1:]]
+        new_certs = [x['CertificateArn'] for x in final_certificates.get(port,[])]
+        add_list = list(set(new_certs) - set(old_certs))
+        remove_list = list(set(old_certs) - set(new_certs))
+        if new_certs[0] not in old_certs and new_certs[0] in remove_list:
+            remove_list.remove(new_certs[0])
+        if add_list:
+            for certificate in add_list:
+                response = elb_obj.connection.add_listener_certificates(ListenerArn=listener.get('ListenerArn'),Certificates=[{'CertificateArn':certificate}])
+                listeners_obj.changed = True
+        if remove_list:
+            for certificate in remove_list:
+                response = elb_obj.connection.remove_listener_certificates(ListenerArn=listener.get('ListenerArn'),Certificates=[{'CertificateArn':certificate}])
+                listeners_obj.changed = True
 
     # If listeners changed, mark ELB as changed
     if listeners_obj.changed:
