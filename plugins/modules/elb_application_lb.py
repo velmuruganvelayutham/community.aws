@@ -598,7 +598,7 @@ def create_or_update_elb(elb_obj):
         new_certs = [x['CertificateArn'] for x in final_certificates.get(port,[])]
         add_list = list(set(new_certs) - set(old_certs))
         remove_list = list(set(old_certs) - set(new_certs))
-        if new_certs[0] not in old_certs and new_certs[0] in remove_list:
+        if len(new_certs) > 1 and new_certs[0] not in old_certs and new_certs[0] in remove_list:
             remove_list.remove(new_certs[0])
         if add_list:
             for certificate in add_list:
